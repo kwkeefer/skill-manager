@@ -1,0 +1,5 @@
+# PROTOTYPE: persistent paths are relative to this file. Project activation is
+# declared separately in examples/project/.skill-manager.yaml.
+catalogs:
+  - catalog.yaml
+state_dir: .prototype-state

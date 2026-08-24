@@ -1,0 +1,25 @@
+sources:
+  matt-pocock:
+    git: https://github.com/mattpocock/skills.git
+    ref: v1.2.3
+    discover:
+      include:
+        - skills/**/SKILL.md
+      exclude:
+        skills:
+          - setup-matt-pocock-skills
+    tags: [coding]
+    skills:
+      grill-me:
+        tags:
+          add: [generic]
+
+profiles:
+  matt-coding:
+    include:
+      - source: matt-pocock
+        tags: [coding]
+
+  generic:
+    include:
+      - tags: [generic]

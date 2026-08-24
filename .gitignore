@@ -1,0 +1,11 @@
+.venv/
+dist/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+examples/.prototype-state/
+examples/.prototype-consumer/
+examples/config.lock.yaml
+examples/project/.agents/
+examples/project/.claude/
