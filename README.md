@@ -81,6 +81,38 @@ Each shim reapplies locked state without networking, suppresses ordinary
 home-directory skills where supported, and launches with the project's profile
 plus unmanaged project-local skills.
 
+### Shims and harness management
+
+Shims isolate agent sessions only. A harness recognizes its own management
+subcommands in the first argument, before it reads any agent options, so
+`pi update`, `pi install <source>`, `pi list`, `pi config`, `pi auth`,
+`claude doctor`, `claude mcp`, `codex exec`, `codex login`, and `--help` or
+`--version` are handed to the real executable with their arguments unchanged and
+without applying project state. Injecting isolation flags ahead of those words
+would make the harness read the subcommand as a prompt, which is why
+`pi update` once started a session prompted with the word `update`.
+
+Arguments after the harness name reach the harness exactly as typed, including
+option-looking values and `--`. Two overrides cover policy drift:
+
+```bash
+# Isolate a launch the shim classified as management, such as a prompt that
+# begins with a subcommand word:
+SKM_LAUNCH_MODE=isolate pi update the flaky tests
+
+# Never intercept a launch, without editing shell startup:
+SKM_LAUNCH_MODE=passthrough pi
+```
+
+Machine configuration can add subcommands a harness introduced after this
+release, so the built-in allowlist never becomes a blocker:
+
+```yaml
+harness_passthrough:
+  pi:
+    - sessions
+```
+
 Inspect the current inventory and classifications:
 
 ```bash
@@ -153,8 +185,10 @@ defines both `active_profile` and `consumers`.
 
 ## Disabling or uninstalling
 
-To stop intercepting harness commands, remove the `PATH` export printed by
-`skm setup` from your shell startup file and remove the generated shims:
+For a single launch, or a temporary pause without editing shell startup, set
+`SKM_LAUNCH_MODE=passthrough`. To stop intercepting harness commands permanently,
+remove the `PATH` export printed by `skm setup` from your shell startup file and
+remove the generated shims:
 
 ```bash
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/skill-manager/shims"
@@ -177,6 +211,8 @@ See [`examples/catalog.yaml`](examples/catalog.yaml) and
 
 ## Prototype limitations
 
+- The management subcommand allowlist is version-pinned; harnesses that add new
+  subcommands need a `harness_passthrough` entry until this tool is revalidated.
 - Non-Git project bindings do not yet have a central path registry.
 - Claude Code setting-source isolation needs integration testing against the installed release.
 - Codex isolation enumerates home skills at process launch and disables them by exact path.

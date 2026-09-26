@@ -20,6 +20,7 @@ from skill_manager.config import (
     initialize_configuration,
     load_configuration,
 )
+from skill_manager.harness import SUPPORTED_HARNESSES
 from skill_manager.project import (
     ProjectRefinements,
     apply_project,
@@ -100,7 +101,9 @@ def main() -> None:
                 console.print(
                     f"[green]✓[/] Configured harness shims: [bold]{', '.join(harnesses)}[/]"
                 )
-                unavailable = sorted({"pi", "claude", "codex"} - set(harnesses))
+                unavailable = sorted(
+                    {harness.value for harness in SUPPORTED_HARNESSES} - set(harnesses)
+                )
                 if unavailable:
                     console.print(
                         "[yellow]–[/] Skipped unavailable harnesses: "
@@ -210,11 +213,20 @@ def _build_parser() -> argparse.ArgumentParser:
     use.add_argument("project", type=Path, nargs="?", default=Path.cwd())
     use.add_argument("--config", type=Path, default=_default_config_path())
 
-    run = project_commands.add_parser("run", help="launch an isolated harness")
+    run = project_commands.add_parser(
+        "run", help="launch a harness with project skill isolation"
+    )
     run.add_argument("config", type=Path)
     run.add_argument("project", type=Path)
-    run.add_argument("harness", choices=("pi", "claude", "codex"))
-    run.add_argument("arguments", nargs=argparse.REMAINDER)
+    run.add_argument(
+        "harness",
+        choices=tuple(harness.value for harness in SUPPORTED_HARNESSES),
+    )
+    run.add_argument(
+        "arguments",
+        nargs=argparse.REMAINDER,
+        help="harness arguments; forward them unchanged after '--'",
+    )
     return parser
 
 
@@ -291,8 +303,8 @@ def _run_project_command(
         )
         return
 
-    project = load_project(arguments.project, configuration.default_project_profile)
     if arguments.project_command == "apply":
+        project = load_project(arguments.project, configuration.default_project_profile)
         project_configuration, _, count = apply_project(configuration, project)
         Console().print(
             "[green]✓[/] Applied project profile "
@@ -300,16 +312,16 @@ def _run_project_command(
             f"with [bold]{count}[/] skill(s)"
         )
     elif arguments.project_command == "env":
+        project = load_project(arguments.project, configuration.default_project_profile)
         print(environment_export(generate_adapters(configuration, project)))
     elif arguments.project_command == "run":
-        harness_arguments = arguments.arguments
-        if harness_arguments[:1] == ["--"]:
-            harness_arguments = harness_arguments[1:]
+        # REMAINDER already consumes the single boundary '--' emitted by shims and
+        # captures every later token verbatim, so harness arguments stay exact.
         run_harness(
             configuration,
-            project,
+            arguments.project,
             arguments.harness,
-            harness_arguments,
+            arguments.arguments,
         )
 
 

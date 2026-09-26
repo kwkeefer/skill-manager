@@ -3,3 +3,11 @@
 catalogs:
   - catalog.yaml
 state_dir: .prototype-state
+
+# Optional: add harness subcommands introduced after this release so they reach
+# the harness unchanged instead of starting an isolated session. Shims already
+# pass through pi update|install|remove|list|config|auth, claude doctor|mcp,
+# codex exec|resume|login, and --help/--version.
+# harness_passthrough:
+#   pi:
+#     - sessions

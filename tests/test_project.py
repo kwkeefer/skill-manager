@@ -7,12 +7,12 @@ import yaml
 
 from skill_manager.catalog import CatalogError
 from skill_manager.config import LoadedConfiguration, load_configuration
+from skill_manager.harness import Harness
 from skill_manager.project import (
     apply_project,
     environment_export,
     generate_adapters,
     generate_global_adapters,
-    harness_command,
     load_project,
     set_project_profile,
 )
@@ -122,40 +122,41 @@ def test_git_local_profile_requires_no_project_file(tmp_path: Path) -> None:
     assert configuration.default_project_profile is None
 
 
-def test_generated_adapters_and_harness_isolation(tmp_path: Path, monkeypatch) -> None:
+def test_generated_adapters_forward_to_project_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     configuration, project_root = _setup(tmp_path)
+    executables = tmp_path / "executables"
+    executables.mkdir()
+    manager = executables / "skm"
+    manager.write_text("#!/bin/sh\nexit 0\n")
+    manager.chmod(0o755)
+    monkeypatch.setenv("PATH", str(executables))
     project = load_project(project_root)
+
     bin_dir = generate_adapters(configuration, project)
-    global_bin_dir = generate_global_adapters(configuration, ("pi", "claude", "codex"))
+    global_bin_dir = generate_global_adapters(
+        configuration, (harness.value for harness in Harness)
+    )
 
     assert environment_export(bin_dir).startswith("export PATH=")
     assert (global_bin_dir / "pi").is_file()
-    assert '"$PWD" pi' in (global_bin_dir / "pi").read_text()
+    assert '"$PWD" pi -- "$@"' in (global_bin_dir / "pi").read_text()
     for harness in ("pi", "claude", "codex"):
         wrapper = bin_dir / harness
         assert os.access(wrapper, os.X_OK)
         assert "skm project run" in wrapper.read_text()
+        assert str(project_root) in wrapper.read_text()
 
-    apply_project(configuration, project)
-    monkeypatch.chdir(project_root)
-    pi_command, _ = harness_command("/usr/bin/pi", "pi", [], project)
-    assert pi_command[:2] == ["/usr/bin/pi", "--no-skills"]
-    assert str(project_root / ".agents" / "skills") in pi_command
 
-    claude_command, _ = harness_command("/usr/bin/claude", "claude", [], project)
-    assert claude_command[:3] == [
-        "/usr/bin/claude",
-        "--setting-sources",
-        "project,local",
-    ]
+def test_generate_global_adapters_rejects_unknown_harness(
+    tmp_path: Path,
+) -> None:
+    configuration, _ = _setup(tmp_path)
 
-    home = tmp_path / "home"
-    _write_skill(home / ".agents" / "skills" / "global", "global")
-    monkeypatch.setenv("HOME", str(home))
-    codex_command, _ = harness_command("/usr/bin/codex", "codex", [], project)
-    assert codex_command[1] == "-c"
-    assert str(home / ".agents" / "skills" / "global" / "SKILL.md") in codex_command[2]
-    assert "enabled=false" in codex_command[2]
+    with pytest.raises(CatalogError, match="unsupported harness"):
+        generate_global_adapters(configuration, ("gemini",))
 
 
 def _setup(tmp_path: Path) -> tuple[LoadedConfiguration, Path]:

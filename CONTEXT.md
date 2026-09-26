@@ -59,3 +59,11 @@ _Avoid_: Project config file
 **Project refinement**:
 A clone-local skill or tag inclusion or exclusion layered over a project's base profile. Explicit skill refinements take precedence over tag refinements, and exclusions take precedence over inclusions at the same specificity.
 _Avoid_: Project dependency, profile mutation
+
+**Isolated session**:
+An agent launch where the manager applies locked project state and suppresses ordinary home-directory skills so the project's profile and unmanaged project-local skills are the only ones exposed.
+_Avoid_: Managed run, sandbox
+
+**Harness pass-through**:
+An agent CLI launch handed to the real executable with unchanged arguments and no project state change, used for harness management subcommands and metadata flags that a harness recognizes only in the first argument.
+_Avoid_: Bypass, skipped launch

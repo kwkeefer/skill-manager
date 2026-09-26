@@ -8,6 +8,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from skill_manager.catalog import Catalog, CatalogError, SourceDeclaration, load_catalog
+from skill_manager.harness import SUPPORTED_HARNESSES, Harness
 
 
 class ConsumerOwnership(StrEnum):
@@ -31,9 +32,23 @@ class MachineConfig(BaseModel):
     default_project_profile: str | None = None
     state_dir: Path | None = None
     consumers: dict[str, ConsumerConfig] = Field(default_factory=dict)
+    harness_passthrough: dict[str, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_consumer_names(self) -> MachineConfig:
+        supported = {harness.value for harness in SUPPORTED_HARNESSES}
+        for name, commands in self.harness_passthrough.items():
+            if name not in supported:
+                raise ValueError(
+                    f"harness_passthrough key '{name}' is not a supported harness: "
+                    f"{', '.join(sorted(supported))}"
+                )
+            for command in commands:
+                if not command or command.startswith("-"):
+                    raise ValueError(
+                        f"invalid harness passthrough command: {command!r};"
+                        " only subcommand names are accepted"
+                    )
         for name in self.consumers:
             if not _is_identifier(name):
                 raise ValueError(f"invalid consumer identifier: {name!r}")
@@ -56,6 +71,7 @@ class LoadedConfiguration(BaseModel):
     active_profile: str | None
     default_project_profile: str | None
     consumers: dict[str, ConsumerConfig]
+    harness_passthrough: dict[Harness, tuple[str, ...]]
 
 
 def initialize_configuration(path: Path) -> bool:
@@ -146,6 +162,10 @@ def load_configuration(path: Path) -> LoadedConfiguration:
         name: consumer.model_copy(update={"path": _resolve_path(consumer.path, base)})
         for name, consumer in config.consumers.items()
     }
+    harness_passthrough = {
+        Harness(name): tuple(commands)
+        for name, commands in config.harness_passthrough.items()
+    }
     return LoadedConfiguration(
         config_path=config_path,
         state_dir=state_dir,
@@ -154,6 +174,7 @@ def load_configuration(path: Path) -> LoadedConfiguration:
         active_profile=config.active_profile,
         default_project_profile=config.default_project_profile,
         consumers=consumers,
+        harness_passthrough=harness_passthrough,
     )
 
 

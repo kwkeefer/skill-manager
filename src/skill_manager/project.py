@@ -5,10 +5,11 @@ import os
 import shlex
 import shutil
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
+from typing import NoReturn
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,8 +20,39 @@ from skill_manager.config import (
     ConsumerOwnership,
     LoadedConfiguration,
 )
+from skill_manager.harness import (
+    SUPPORTED_HARNESSES,
+    Harness,
+    LaunchKind,
+    announce_passthrough,
+    classify_launch,
+    environment_export,
+    exec_harness,
+    external_search_path,
+    find_executable,
+    harness_command,
+    parse_harness,
+    resolve_launch_mode,
+)
 from skill_manager.provision import apply_profile
 from skill_manager.storage import build_profile_view, load_lock, resolve_locked_profile
+
+__all__ = [
+    "GlobalSkillsPolicy",
+    "LoadedProject",
+    "ProjectDeclaration",
+    "ProjectRefinements",
+    "apply_project",
+    "environment_export",
+    "generate_adapters",
+    "generate_global_adapters",
+    "installed_harnesses",
+    "load_project",
+    "refine_project_selection",
+    "run_harness",
+    "set_project_profile",
+    "set_project_refinements",
+]
 
 
 class GlobalSkillsPolicy(StrEnum):
@@ -190,34 +222,21 @@ def generate_adapters(
 ) -> Path:
     """Generate PATH shims that launch each harness with project isolation."""
     adapter_dir = _adapter_dir(configuration, project)
-    bin_dir = adapter_dir / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    manager = shutil.which("skm")
-    if manager is None:
-        raise CatalogError("cannot locate the skm executable")
-    for harness in ("pi", "claude", "codex"):
-        script = (
-            "#!/bin/sh\n"
-            f"exec {shlex.quote(manager)} project run "
-            f"{shlex.quote(str(configuration.config_path))} "
-            f"{shlex.quote(str(project.root))} "
-            f'{harness} -- "$@"\n'
-        )
-        path = bin_dir / harness
-        temporary = bin_dir / f".{harness}.{os.getpid()}.tmp"
-        temporary.write_text(script)
-        temporary.chmod(0o755)
-        os.replace(temporary, path)
-    return bin_dir
+    return _write_adapter_bin(
+        adapter_dir / "bin",
+        configuration=configuration,
+        harnesses=SUPPORTED_HARNESSES,
+        project_argument=shlex.quote(str(project.root)),
+    )
 
 
 def installed_harnesses(configuration: LoadedConfiguration) -> tuple[str, ...]:
     """Return harnesses with real executables outside manager-owned state."""
-    search = _external_search_path(configuration)
+    search = external_search_path(_managed_dirs(configuration))
     return tuple(
-        harness
-        for harness in ("pi", "claude", "codex")
-        if shutil.which(harness, path=search) is not None
+        harness.value
+        for harness in SUPPORTED_HARNESSES
+        if shutil.which(harness.value, path=search) is not None
     )
 
 
@@ -225,88 +244,97 @@ def generate_global_adapters(
     configuration: LoadedConfiguration,
     harnesses: Iterable[str],
 ) -> Path:
-    """Generate stable shims for selected installed harnesses."""
-    selected = tuple(harnesses)
-    invalid = set(selected) - {"pi", "claude", "codex"}
-    if invalid:
-        raise CatalogError(f"unsupported harness: {min(invalid)}")
+    """Generate stable machine-level shims for the selected harnesses."""
+    selected = tuple(parse_harness(harness) for harness in harnesses)
     bin_dir = configuration.state_dir / "shims" / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    for harness in ("pi", "claude", "codex"):
+    for harness in SUPPORTED_HARNESSES:
         if harness not in selected:
-            (bin_dir / harness).unlink(missing_ok=True)
+            (bin_dir / harness.value).unlink(missing_ok=True)
     if not selected:
         return bin_dir
-
-    manager = shutil.which("skm", path=_external_search_path(configuration))
-    if manager is None:
-        raise CatalogError("cannot locate the skm executable outside managed shims")
-    for harness in selected:
-        script = (
-            "#!/bin/sh\n"
-            f"exec {shlex.quote(manager)} project run "
-            f"{shlex.quote(str(configuration.config_path))} "
-            f'"$PWD" {harness} -- "$@"\n'
-        )
-        path = bin_dir / harness
-        temporary = bin_dir / f".{harness}.{os.getpid()}.tmp"
-        temporary.write_text(script)
-        temporary.chmod(0o755)
-        os.replace(temporary, path)
-    return bin_dir
-
-
-def environment_export(bin_dir: Path) -> str:
-    """Return POSIX shell code suitable for eval from direnv or shell startup."""
-    return f'export PATH={shlex.quote(str(bin_dir))}:"$PATH"'
+    return _write_adapter_bin(
+        bin_dir,
+        configuration=configuration,
+        harnesses=selected,
+        project_argument='"$PWD"',
+    )
 
 
 def run_harness(
     configuration: LoadedConfiguration,
-    project: LoadedProject,
+    project_path: Path,
     harness: str,
-    arguments: list[str],
-) -> None:
-    """Apply project state and replace this process with an isolated harness."""
-    if harness not in {"pi", "claude", "codex"}:
-        raise CatalogError(f"unsupported harness: {harness}")
+    arguments: Sequence[str],
+) -> NoReturn:
+    """Launch a harness, isolating sessions but never harness management.
+
+    Agent sessions get locked project state applied and isolation flags injected.
+    Management subcommands such as `pi update` are handed to the real executable
+    untouched, without reading the project or mutating project state, because a
+    harness recognizes them only in the first argument position.
+    """
+    selected = parse_harness(harness)
+    kind = classify_launch(
+        selected,
+        arguments,
+        mode=resolve_launch_mode(os.environ),
+        extra_subcommands=configuration.harness_passthrough.get(selected, ()),
+    )
+    executable = find_executable(
+        selected,
+        search_path=external_search_path(_managed_dirs(configuration)),
+    )
+    if kind is LaunchKind.PASSTHROUGH:
+        announce_passthrough(selected, arguments)
+        exec_harness([executable, *arguments], os.environ)
+
+    project = load_project(project_path, configuration.default_project_profile)
     apply_project(configuration, project)
-    executable = _find_real_executable(configuration, project, harness)
     command, environment = harness_command(
         executable,
-        harness,
+        selected,
         arguments,
-        project,
+        project_root=project.root,
+        isolate_skills=project.declaration.global_skills is GlobalSkillsPolicy.DISABLED,
     )
-    os.execvpe(executable, command, environment)
+    exec_harness(command, environment)
 
 
-def harness_command(
-    executable: str,
-    harness: str,
-    arguments: list[str],
-    project: LoadedProject,
-) -> tuple[list[str], dict[str, str]]:
-    """Construct one harness launch without executing it."""
-    command = [executable]
-    environment = dict(os.environ)
-    if project.declaration.global_skills is GlobalSkillsPolicy.ENABLED:
-        return [*command, *arguments], environment
+def _write_adapter_bin(
+    bin_dir: Path,
+    *,
+    configuration: LoadedConfiguration,
+    harnesses: Iterable[Harness],
+    project_argument: str,
+) -> Path:
+    """Atomically write one directory of harness shims forwarding to skm."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    manager = shutil.which(
+        "skm",
+        path=external_search_path(_managed_dirs(configuration)),
+    )
+    if manager is None:
+        raise CatalogError("cannot locate the skm executable outside managed shims")
+    for harness in harnesses:
+        script = (
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(manager)} project run "
+            f"{shlex.quote(str(configuration.config_path))} "
+            f'{project_argument} {harness.value} -- "$@"\n'
+        )
+        path = bin_dir / harness.value
+        temporary = bin_dir / f".{harness.value}.{os.getpid()}.tmp"
+        try:
+            temporary.write_text(script)
+            temporary.chmod(0o755)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return bin_dir
 
-    if harness == "pi":
-        command.append("--no-skills")
-        for skill_path in _pi_project_skill_paths(project.root, Path.cwd()):
-            command.extend(("--skill", str(skill_path)))
-    elif harness == "claude":
-        command.extend(("--setting-sources", "project,local"))
-    elif harness == "codex":
-        disabled = _codex_home_skill_overrides()
-        if disabled:
-            command.extend(("-c", f"skills.config={disabled}"))
-    else:
-        raise CatalogError(f"unsupported harness: {harness}")
-    command.extend(arguments)
-    return command, environment
+
+def _managed_dirs(configuration: LoadedConfiguration) -> tuple[Path, ...]:
+    return (configuration.state_dir,)
 
 
 def _project_configuration(
@@ -338,46 +366,6 @@ def _adapter_dir(
 ) -> Path:
     identity = sha256(str(project.root).encode()).hexdigest()[:16]
     return configuration.state_dir / "project-adapters" / identity
-
-
-def _find_real_executable(
-    configuration: LoadedConfiguration,
-    project: LoadedProject,
-    harness: str,
-) -> str:
-    search = _external_search_path(configuration)
-    executable = shutil.which(harness, path=search)
-    if executable is None:
-        raise CatalogError(
-            f"cannot find real '{harness}' executable outside adapter PATH"
-        )
-    return executable
-
-
-def _external_search_path(configuration: LoadedConfiguration) -> str:
-    state_dir = configuration.state_dir.resolve()
-    return os.pathsep.join(
-        entry
-        for entry in os.environ.get("PATH", "").split(os.pathsep)
-        if not Path(entry).resolve().is_relative_to(state_dir)
-    )
-
-
-def _pi_project_skill_paths(project_root: Path, cwd: Path) -> list[Path]:
-    current = cwd.resolve()
-    root = project_root.resolve()
-    if not current.is_relative_to(root):
-        current = root
-    directories: list[Path] = []
-    while True:
-        for relative in (Path(".agents/skills"), Path(".pi/skills")):
-            candidate = current / relative
-            if candidate.is_dir():
-                directories.append(candidate)
-        if current == root:
-            break
-        current = current.parent
-    return directories
 
 
 def _git_root(path: Path) -> Path | None:
@@ -502,16 +490,3 @@ def _duplicate_names(skills: Iterable[ResolvedSkill]) -> set[str]:
             duplicates.add(skill.name)
         seen.add(skill.name)
     return duplicates
-
-
-def _codex_home_skill_overrides() -> str:
-    root = Path.home() / ".agents" / "skills"
-    if not root.is_dir():
-        return ""
-    paths = [
-        str(skill_file)
-        for entry in sorted(root.iterdir())
-        if (skill_file := entry / "SKILL.md").is_file()
-    ]
-    entries = ",".join(f"{{path={json.dumps(path)},enabled=false}}" for path in paths)
-    return f"[{entries}]"
