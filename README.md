@@ -8,6 +8,27 @@ profiles select discovered skills using source, tag, and name constraints.
 Project-scoped activation is the default; persistent storage is never directly
 scanned by harnesses.
 
+## Why this exists
+
+I kept running into the same problem across different projects: they needed many
+of the same skills, but not quite the same set. Copying skill files into every
+repository made updates tedious and let the copies drift apart. Installing all
+of them globally avoided duplication, but created a different problem: every
+agent saw an ever-growing collection of skills, including many that had nothing
+to do with the project in front of it.
+
+That kind of skill sprawl is more than untidy. A large global catalog gives the
+agent more descriptions to consider, makes accidental or ambiguous skill
+activation more likely, and spends context on capabilities that are irrelevant
+to the current task. The useful set of skills for a Rust service is not
+necessarily the useful set for a Python library or a writing project.
+
+Skill Manager exists to separate **where skills come from** from **where they
+are enabled**. Multiple projects can reuse skills from the same maintained,
+versioned sources, while custom profiles select only the skills appropriate for
+a particular project. This keeps shared skills consistent without forcing every
+skill into every agent session.
+
 ## Installation
 
 Skill Manager currently supports macOS and Linux with Python 3.14 or newer, Git,
