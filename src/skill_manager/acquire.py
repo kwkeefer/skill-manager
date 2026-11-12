@@ -67,7 +67,16 @@ def acquire_locked_source(
         root = Path(temporary) / "source"
         _run_git("init", "--quiet", str(root))
         _run_git("-C", str(root), "remote", "add", "origin", source.git)
-        _run_git("-C", str(root), "fetch", "--quiet", "origin", source.ref)
+        _run_git(
+            "-C",
+            str(root),
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "origin",
+            resolved_revision,
+        )
         try:
             _run_git(
                 "-C",
@@ -80,7 +89,7 @@ def acquire_locked_source(
         except CatalogError as error:
             raise CatalogError(
                 f"locked revision {resolved_revision} for source '{source_name}' "
-                "is not available from its requested ref"
+                "is not available from its source"
             ) from error
         actual_revision = _run_git("-C", str(root), "rev-parse", "HEAD").strip()
         if actual_revision != resolved_revision:

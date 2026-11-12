@@ -1,2 +1,3 @@
+catalog:
+  path: ../catalog.yaml
 profile: generic
-global_skills: disabled

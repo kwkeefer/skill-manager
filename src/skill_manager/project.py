@@ -1,478 +1,313 @@
-"""Project-scoped profile activation and harness launch adapters."""
+"""Explicit project installation, offline status, and owned-link removal."""
 
-import json
-import os
-import shlex
-import shutil
 import subprocess
-from collections.abc import Iterable, Sequence
-from enum import StrEnum
-from hashlib import sha256
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from skill_manager.catalog import CatalogError, ResolvedSkill, ResolvedSource
-from skill_manager.config import (
-    ConsumerConfig,
-    ConsumerOwnership,
-    LoadedConfiguration,
+from skill_manager.catalog import CatalogError
+from skill_manager.config import load_declaration
+from skill_manager.filesystem import Transaction, digest, file_lock, yaml_bytes
+from skill_manager.provision import (
+    ConsumerPlan,
+    apply_plans,
+    consumer_issues,
+    consumers,
+    plan_consumers,
+    project_identity,
 )
-from skill_manager.harness import (
-    SUPPORTED_HARNESSES,
-    Harness,
-    LaunchKind,
-    announce_passthrough,
-    classify_launch,
-    environment_export,
-    exec_harness,
-    external_search_path,
-    find_executable,
-    harness_command,
-    parse_harness,
-    resolve_launch_mode,
+from skill_manager.storage import (
+    LOCK_NAME,
+    Resolution,
+    build_profile_view,
+    profile_view_path,
+    resolve_installation,
 )
-from skill_manager.provision import apply_profile
-from skill_manager.storage import build_profile_view, load_lock, resolve_locked_profile
 
-__all__ = [
-    "GlobalSkillsPolicy",
-    "LoadedProject",
-    "ProjectDeclaration",
-    "ProjectRefinements",
-    "apply_project",
-    "environment_export",
-    "generate_adapters",
-    "generate_global_adapters",
-    "installed_harnesses",
-    "load_project",
-    "refine_project_selection",
-    "run_harness",
-    "set_project_profile",
-    "set_project_refinements",
-]
+DECLARATION_NAME = ".skill-manager.yaml"
 
 
-class GlobalSkillsPolicy(StrEnum):
-    DISABLED = "disabled"
-    ENABLED = "enabled"
-
-
-class ProjectDeclaration(BaseModel):
+class InstallationReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
-    profile: str
-    global_skills: GlobalSkillsPolicy = GlobalSkillsPolicy.DISABLED
-
-
-class ProjectRefinements(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    include_skills: frozenset[str] = Field(default_factory=frozenset)
-    exclude_skills: frozenset[str] = Field(default_factory=frozenset)
-    include_tags: frozenset[str] = Field(default_factory=frozenset)
-    exclude_tags: frozenset[str] = Field(default_factory=frozenset)
+    version: Literal[1] = 1
+    project_root: Path
+    lock_digest: str
 
 
-class LoadedProject(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    root: Path
-    declaration_path: Path | None
-    declaration: ProjectDeclaration
-    refinements: ProjectRefinements = Field(default_factory=ProjectRefinements)
+@dataclass(frozen=True)
+class ProjectStatus:
+    issues: tuple[str, ...]
+    selected_names: tuple[str, ...] = ()
 
 
-def load_project(
+def locate_project(
     path: Path,
-    default_profile: str | None = None,
-) -> LoadedProject:
-    """Resolve a project profile from a declaration, local Git config, or default."""
-    candidate = path.expanduser().resolve()
-    explicit_file = candidate if candidate.is_file() else None
-    local_declaration = (
-        candidate / ".skill-manager.yaml" if candidate.is_dir() else None
-    )
-    declaration_path = explicit_file or (
-        local_declaration if local_declaration and local_declaration.is_file() else None
-    )
-    search_from = candidate.parent if explicit_file else candidate
-    git_root = _git_root(search_from)
-    if declaration_path is None and git_root is not None:
-        root_declaration = git_root / ".skill-manager.yaml"
-        if root_declaration.is_file():
-            declaration_path = root_declaration
-    root = declaration_path.parent if declaration_path else (git_root or search_from)
-
-    if declaration_path is not None:
-        try:
-            raw = yaml.safe_load(declaration_path.read_text())
-        except (OSError, yaml.YAMLError) as error:
-            raise CatalogError(
-                f"cannot read project declaration {declaration_path}: {error}"
-            ) from error
-        declaration = ProjectDeclaration.model_validate(raw)
-        return LoadedProject(
-            root=declaration_path.parent,
-            declaration_path=declaration_path,
-            declaration=declaration,
-            refinements=_git_refinements(root),
-        )
-
-    profile = _git_profile(root) or default_profile
-    if profile is None:
-        raise CatalogError("project has no profile; run 'skm project use <profile>'")
-    return LoadedProject(
-        root=root,
-        declaration_path=None,
-        declaration=ProjectDeclaration(profile=profile),
-        refinements=_git_refinements(root),
-    )
-
-
-def set_project_refinements(
-    path: Path,
-    refinements: ProjectRefinements,
-) -> Path:
-    """Persist clone-local skill and tag refinements in Git configuration."""
-    root = _git_root(path.expanduser().resolve())
-    if root is None:
-        raise CatalogError("project refinements currently require a Git repository")
-    value = json.dumps(
-        {
-            "include_skills": sorted(refinements.include_skills),
-            "exclude_skills": sorted(refinements.exclude_skills),
-            "include_tags": sorted(refinements.include_tags),
-            "exclude_tags": sorted(refinements.exclude_tags),
-        },
-        separators=(",", ":"),
-    )
-    _run_git(root, "config", "--local", "skill-manager.refinements", value)
-    return root
-
-
-def set_project_profile(path: Path, profile: str) -> Path:
-    """Store a clone-local profile binding in .git/config."""
-    candidate = path.expanduser().resolve()
-    root = _git_root(candidate)
-    if root is None:
-        raise CatalogError("project use currently requires a Git repository")
-    _run_git(root, "config", "--local", "skill-manager.profile", profile)
-    return root
-
-
-def apply_project(
-    configuration: LoadedConfiguration,
-    project: LoadedProject,
-) -> tuple[LoadedConfiguration, Path, int]:
-    """Apply a locked profile into shared project-local skill directories."""
-    if project.declaration.profile not in configuration.catalog.profiles:
-        raise CatalogError(f"unknown project profile '{project.declaration.profile}'")
-    project_configuration = _project_configuration(configuration, project)
-    lock = load_lock(project_configuration)
-    sources, selected = resolve_locked_profile(project_configuration, lock)
-    selected = refine_project_selection(sources, selected, project.refinements)
-    view = build_profile_view(project_configuration, selected)
-    apply_profile(project_configuration, selected, view)
-    _update_git_excludes(project.root, {skill.name for skill in selected})
-    return project_configuration, view, len(selected)
-
-
-def refine_project_selection(
-    sources: tuple[ResolvedSource, ...],
-    base: tuple[ResolvedSkill, ...],
-    refinements: ProjectRefinements,
-) -> tuple[ResolvedSkill, ...]:
-    """Apply project-local tag and skill refinements to a base profile."""
-    inventory = tuple(skill for source in sources for skill in source.skills)
-    selected = {(skill.source, skill.name): skill for skill in base}
-
-    for skill in inventory:
-        key = (skill.source, skill.name)
-        if skill.tags & refinements.include_tags:
-            selected[key] = skill
-    for key, skill in tuple(selected.items()):
-        if skill.tags & refinements.exclude_tags:
-            del selected[key]
-    for skill in inventory:
-        if skill.name in refinements.include_skills:
-            selected[(skill.source, skill.name)] = skill
-    for key, skill in tuple(selected.items()):
-        if skill.name in refinements.exclude_skills:
-            del selected[key]
-
-    duplicate_names = _duplicate_names(selected.values())
-    if duplicate_names:
-        raise CatalogError(
-            "project selection contains duplicate skill names: "
-            + ", ".join(sorted(duplicate_names))
-        )
-    if not selected:
-        raise CatalogError("project refinements select no skills")
-    return tuple(
-        sorted(selected.values(), key=lambda skill: (skill.source, skill.name))
-    )
-
-
-def generate_adapters(
-    configuration: LoadedConfiguration,
-    project: LoadedProject,
-) -> Path:
-    """Generate PATH shims that launch each harness with project isolation."""
-    adapter_dir = _adapter_dir(configuration, project)
-    return _write_adapter_bin(
-        adapter_dir / "bin",
-        configuration=configuration,
-        harnesses=SUPPORTED_HARNESSES,
-        project_argument=shlex.quote(str(project.root)),
-    )
-
-
-def installed_harnesses(configuration: LoadedConfiguration) -> tuple[str, ...]:
-    """Return harnesses with real executables outside manager-owned state."""
-    search = external_search_path(_managed_dirs(configuration))
-    return tuple(
-        harness.value
-        for harness in SUPPORTED_HARNESSES
-        if shutil.which(harness.value, path=search) is not None
-    )
-
-
-def generate_global_adapters(
-    configuration: LoadedConfiguration,
-    harnesses: Iterable[str],
-) -> Path:
-    """Generate stable machine-level shims for the selected harnesses."""
-    selected = tuple(parse_harness(harness) for harness in harnesses)
-    bin_dir = configuration.state_dir / "shims" / "bin"
-    for harness in SUPPORTED_HARNESSES:
-        if harness not in selected:
-            (bin_dir / harness.value).unlink(missing_ok=True)
-    if not selected:
-        return bin_dir
-    return _write_adapter_bin(
-        bin_dir,
-        configuration=configuration,
-        harnesses=selected,
-        project_argument='"$PWD"',
-    )
-
-
-def run_harness(
-    configuration: LoadedConfiguration,
-    project_path: Path,
-    harness: str,
-    arguments: Sequence[str],
-) -> NoReturn:
-    """Launch a harness, isolating sessions but never harness management.
-
-    Agent sessions get locked project state applied and isolation flags injected.
-    Management subcommands such as `pi update` are handed to the real executable
-    untouched, without reading the project or mutating project state, because a
-    harness recognizes them only in the first argument position.
-    """
-    selected = parse_harness(harness)
-    kind = classify_launch(
-        selected,
-        arguments,
-        mode=resolve_launch_mode(os.environ),
-        extra_subcommands=configuration.harness_passthrough.get(selected, ()),
-    )
-    executable = find_executable(
-        selected,
-        search_path=external_search_path(_managed_dirs(configuration)),
-    )
-    if kind is LaunchKind.PASSTHROUGH:
-        announce_passthrough(selected, arguments)
-        exec_harness([executable, *arguments], os.environ)
-
-    project = load_project(project_path, configuration.default_project_profile)
-    apply_project(configuration, project)
-    command, environment = harness_command(
-        executable,
-        selected,
-        arguments,
-        project_root=project.root,
-        isolate_skills=project.declaration.global_skills is GlobalSkillsPolicy.DISABLED,
-    )
-    exec_harness(command, environment)
-
-
-def _write_adapter_bin(
-    bin_dir: Path,
     *,
-    configuration: LoadedConfiguration,
-    harnesses: Iterable[Harness],
-    project_argument: str,
+    require_declaration: bool = True,
+    state_dir: Path | None = None,
 ) -> Path:
-    """Atomically write one directory of harness shims forwarding to skm."""
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    manager = shutil.which(
-        "skm",
-        path=external_search_path(_managed_dirs(configuration)),
-    )
-    if manager is None:
-        raise CatalogError("cannot locate the skm executable outside managed shims")
-    for harness in harnesses:
-        script = (
-            "#!/bin/sh\n"
-            f"exec {shlex.quote(manager)} project run "
-            f"{shlex.quote(str(configuration.config_path))} "
-            f'{project_argument} {harness.value} -- "$@"\n'
-        )
-        path = bin_dir / harness.value
-        temporary = bin_dir / f".{harness.value}.{os.getpid()}.tmp"
-        try:
-            temporary.write_text(script)
-            temporary.chmod(0o755)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
-    return bin_dir
+    """Find a declaration, or an uninstall boundary, within the Git root.
 
-
-def _managed_dirs(configuration: LoadedConfiguration) -> tuple[Path, ...]:
-    return (configuration.state_dir,)
-
-
-def _project_configuration(
-    configuration: LoadedConfiguration,
-    project: LoadedProject,
-) -> LoadedConfiguration:
-    identity = sha256(str(project.root).encode()).hexdigest()[:16]
-    consumers = {
-        f"project-{identity}-agents": ConsumerConfig(
-            path=project.root / ".agents" / "skills",
-            ownership=ConsumerOwnership.SHARED,
-        ),
-        f"project-{identity}-claude": ConsumerConfig(
-            path=project.root / ".claude" / "skills",
-            ownership=ConsumerOwnership.SHARED,
-        ),
-    }
-    return configuration.model_copy(
-        update={
-            "active_profile": project.declaration.profile,
-            "consumers": consumers,
-        }
+    Uninstall also recognizes persisted project state when the declaration has
+    been removed. Retained writer locks keep repeated legacy uninstalls scoped
+    to the same project after its manifests and receipt have been removed.
+    """
+    candidate = path.expanduser().resolve()
+    if candidate.is_file():
+        if candidate.name != DECLARATION_NAME:
+            raise CatalogError(f"expected {DECLARATION_NAME}, got {candidate}")
+        candidate = candidate.parent
+    if not candidate.is_dir():
+        raise CatalogError(f"project directory does not exist: {candidate}")
+    git_root = _git_root(candidate)
+    current = candidate
+    while True:
+        if not require_declaration and state_dir is not None:
+            markers = (
+                current / LOCK_NAME,
+                _receipt_path(current, state_dir),
+                _project_lock(current, state_dir),
+                *(consumer.manifest_path for consumer in consumers(current, state_dir)),
+            )
+            if any(marker.exists(follow_symlinks=False) for marker in markers):
+                return current
+        if (current / DECLARATION_NAME).is_file():
+            return current
+        if current == git_root or current.parent == current:
+            break
+        current = current.parent
+    if not require_declaration:
+        return git_root or candidate
+    raise CatalogError(
+        f"no {DECLARATION_NAME} found; declare a catalog and profile explicitly"
     )
 
 
-def _adapter_dir(
-    configuration: LoadedConfiguration,
-    project: LoadedProject,
-) -> Path:
-    identity = sha256(str(project.root).encode()).hexdigest()[:16]
-    return configuration.state_dir / "project-adapters" / identity
-
-
-def _git_root(path: Path) -> Path | None:
-    try:
-        output = _run_git(path, "rev-parse", "--show-toplevel")
-    except CatalogError:
-        return None
-    return Path(output).resolve()
-
-
-def _git_refinements(path: Path) -> ProjectRefinements:
-    root = _git_root(path)
-    if root is None:
-        return ProjectRefinements()
-    try:
-        raw = _run_git(
-            root,
-            "config",
-            "--local",
-            "--get",
-            "skill-manager.refinements",
-        )
-    except CatalogError:
-        return ProjectRefinements()
-    try:
-        return ProjectRefinements.model_validate_json(raw)
-    except ValueError as error:
+def install_project(
+    path: Path,
+    state_dir: Path,
+    *,
+    update: bool = False,
+    locked: bool = False,
+) -> Resolution:
+    """Install/update as one rollback-capable operation after all preflights."""
+    root = locate_project(path)
+    if root in {Path(root.anchor), Path.home().resolve()}:
         raise CatalogError(
-            "invalid skill-manager.refinements in local Git config"
-        ) from error
-
-
-def _git_profile(root: Path) -> str | None:
-    try:
-        return _run_git(
-            root,
-            "config",
-            "--local",
-            "--get",
-            "skill-manager.profile",
+            "installation requires a project directory, not the filesystem root or home directory"
         )
-    except CatalogError:
-        return None
+    with file_lock(_project_lock(root, state_dir)):
+        declaration = load_declaration(root / DECLARATION_NAME)
+        resolution = resolve_installation(
+            root, declaration, state_dir, update=update, locked=locked
+        )
+        view = build_profile_view(state_dir, declaration.profile, resolution.selected)
+        plans = plan_consumers(root, state_dir, resolution.selected, view)
+        _reject_tracked_entries(root, plans)
+        exclude_path = _exclude_path(root)
+        guard = (
+            file_lock(state_dir / "locks" / f"exclude-{digest(str(exclude_path))}.lock")
+            if exclude_path
+            else nullcontext()
+        )
+        with guard:
+            exclude_content = (
+                _exclude_content(
+                    root, exclude_path, {skill.name for skill in resolution.selected}
+                )
+                if exclude_path
+                else None
+            )
+            receipt = InstallationReceipt(
+                project_root=root, lock_digest=resolution.lock.fingerprint()
+            )
+            with Transaction() as transaction:
+                apply_plans(plans, transaction)
+                if exclude_path is not None and exclude_content is not None:
+                    transaction.write(exclude_path, exclude_content)
+                if update or not (root / LOCK_NAME).exists():
+                    transaction.write(
+                        root / LOCK_NAME,
+                        yaml_bytes(resolution.lock.model_dump(mode="json")),
+                    )
+                transaction.write(
+                    _receipt_path(root, state_dir),
+                    yaml_bytes(receipt.model_dump(mode="json")),
+                )
+        return resolution
 
 
-def _run_git(cwd: Path, *arguments: str) -> str:
+def uninstall_project(path: Path, state_dir: Path) -> int:
+    """Remove verified owned links, including legacy installs, without a catalog."""
+    root = locate_project(path, require_declaration=False, state_dir=state_dir)
+    with file_lock(_project_lock(root, state_dir)):
+        plans = plan_consumers(root, state_dir, (), None)
+        _reject_tracked_entries(root, plans)
+        count = len({name for plan in plans for name in plan.previous.entries})
+        exclude_path = _exclude_path(root)
+        guard = (
+            file_lock(state_dir / "locks" / f"exclude-{digest(str(exclude_path))}.lock")
+            if exclude_path
+            else nullcontext()
+        )
+        with guard:
+            content = (
+                _exclude_content(root, exclude_path, set()) if exclude_path else None
+            )
+            with Transaction() as transaction:
+                apply_plans(plans, transaction, uninstall=True)
+                if (
+                    exclude_path is not None
+                    and content is not None
+                    and exclude_path.exists()
+                ):
+                    transaction.write(exclude_path, content)
+                transaction.remove(_receipt_path(root, state_dir))
+        return count
+
+
+def project_status(path: Path, state_dir: Path) -> ProjectStatus:
+    """Compare declaration, lock, receipt, links and Git excludes without writes."""
+    root = locate_project(path)
+    try:
+        declaration = load_declaration(root / DECLARATION_NAME)
+        resolution = resolve_installation(
+            root, declaration, state_dir, locked=True, network=False
+        )
+        view = profile_view_path(state_dir, declaration.profile, resolution.selected)
+        issues = consumer_issues(root, state_dir, resolution.selected, view)
+        receipt_path = _receipt_path(root, state_dir)
+        if not receipt_path.is_file():
+            issues.append("no installation receipt; run skm install")
+        else:
+            receipt = InstallationReceipt.model_validate(
+                yaml.safe_load(receipt_path.read_text())
+            )
+            if (
+                receipt.project_root != root
+                or receipt.lock_digest != resolution.lock.fingerprint()
+            ):
+                issues.append(
+                    "installed lock differs from the project lock; run skm install"
+                )
+        exclude_path = _exclude_path(root)
+        if exclude_path:
+            expected = _exclude_content(
+                root, exclude_path, {skill.name for skill in resolution.selected}
+            )
+            actual = exclude_path.read_bytes() if exclude_path.exists() else b""
+            if expected != actual:
+                issues.append(
+                    "generated skill links are not covered by the expected Git exclude block"
+                )
+        # Even an unchanged ignore block does not hide previously tracked links.
+        if not issues:
+            _reject_tracked_entries(
+                root, plan_consumers(root, state_dir, resolution.selected, view)
+            )
+        return ProjectStatus(
+            tuple(issues), tuple(skill.name for skill in resolution.selected)
+        )
+    except (CatalogError, ValidationError, OSError, yaml.YAMLError) as error:
+        return ProjectStatus((str(error),))
+
+
+def list_project(path: Path, state_dir: Path) -> Resolution:
+    """Inspect the locked catalog, or resolve a first catalog into shared caches."""
+    root = locate_project(path)
+    declaration = load_declaration(root / DECLARATION_NAME)
+    return resolve_installation(root, declaration, state_dir)
+
+
+def _project_lock(root: Path, state_dir: Path) -> Path:
+    return state_dir / "locks" / f"project-{project_identity(root)}.lock"
+
+
+def _receipt_path(root: Path, state_dir: Path) -> Path:
+    return state_dir / "installations" / f"{project_identity(root)}.yaml"
+
+
+def _run_git(root: Path, *arguments: str) -> str:
     try:
         result = subprocess.run(
-            ["git", *arguments],
-            cwd=cwd,
+            ["git", "--literal-pathspecs", "-C", str(root), *arguments],
             check=True,
             capture_output=True,
             text=True,
         )
     except FileNotFoundError as error:
-        raise CatalogError("git is required for project profile bindings") from error
+        raise CatalogError("git is required for Git project bookkeeping") from error
     except subprocess.CalledProcessError as error:
-        detail = error.stderr.strip() or error.stdout.strip() or "Git command failed"
-        raise CatalogError(detail) from error
-    return result.stdout.strip()
+        raise CatalogError(error.stderr.strip() or "Git command failed") from error
+    return result.stdout
 
 
-def _update_git_excludes(project_root: Path, skill_names: set[str]) -> None:
-    git_root = _git_root(project_root)
-    if git_root is None:
-        return
-    git_path = Path(_run_git(git_root, "rev-parse", "--git-path", "info/exclude"))
-    if not git_path.is_absolute():
-        git_path = git_root / git_path
-    identity = sha256(str(project_root.resolve()).encode()).hexdigest()[:16]
-    begin = f"# BEGIN skill-manager:{identity}"
-    end = f"# END skill-manager:{identity}"
+def _git_root(path: Path) -> Path | None:
     try:
-        lines = git_path.read_text().splitlines()
-    except FileNotFoundError:
-        lines = []
-    except OSError as error:
-        raise CatalogError(
-            f"cannot read Git exclude file {git_path}: {error}"
-        ) from error
+        return Path(_run_git(path, "rev-parse", "--show-toplevel").strip()).resolve()
+    except CatalogError as error:
+        if "not a git repository" in str(error):
+            return None
+        raise
 
+
+def _exclude_path(root: Path) -> Path | None:
+    git_root = _git_root(root)
+    if git_root is None:
+        return None
+    path = Path(_run_git(git_root, "rev-parse", "--git-path", "info/exclude").strip())
+    return path if path.is_absolute() else git_root / path
+
+
+def _reject_tracked_entries(root: Path, plans: tuple[ConsumerPlan, ...]) -> None:
+    if _git_root(root) is None:
+        return
+    paths = [
+        str((plan.consumer.path / name).relative_to(root))
+        for plan in plans
+        for name in plan.previous.entries.keys() | plan.desired.keys()
+    ]
+    if paths:
+        tracked = _run_git(root, "ls-files", "-z", "--", *paths).split("\0")
+        if tracked[0]:
+            raise CatalogError(
+                f"refusing to manage Git-tracked skill entry: {tracked[0]}"
+            )
+
+
+def _exclude_content(root: Path, path: Path, names: set[str]) -> bytes:
+    if path.is_symlink():
+        raise CatalogError(f"Git exclude file is a symlink: {path}")
+    git_root = _git_root(root)
+    assert git_root is not None
+    identity = project_identity(root)
+    begin, end = f"# BEGIN skill-manager:{identity}", f"# END skill-manager:{identity}"
+    lines = path.read_text().splitlines() if path.exists() else []
+    original = list(lines)
+    insertion = len(lines)
     if begin in lines:
         start = lines.index(begin)
-        try:
-            stop = lines.index(end, start + 1)
-        except ValueError as error:
-            raise CatalogError(f"unclosed skill-manager block in {git_path}") from error
-        del lines[start : stop + 1]
-
-    project_relative = project_root.resolve().relative_to(git_root)
-    patterns = []
-    for directory in (Path(".agents/skills"), Path(".claude/skills")):
-        for name in sorted(skill_names):
-            relative = project_relative / directory / name
-            patterns.append("/" + _escape_gitignore(relative.as_posix()))
-    if patterns:
-        if lines and lines[-1]:
-            lines.append("")
-        lines.extend((begin, *patterns, end))
-
-    git_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = git_path.with_name(f".{git_path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text("\n".join(lines) + ("\n" if lines else ""))
-        os.replace(temporary, git_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        if lines.count(begin) != 1 or lines.count(end) != 1 or lines.index(end) < start:
+            raise CatalogError(f"malformed skill-manager exclude block in {path}")
+        del lines[start : lines.index(end) + 1]
+        insertion = start
+    elif end in lines:
+        raise CatalogError(f"malformed skill-manager exclude block in {path}")
+    if names:
+        relative = root.relative_to(git_root)
+        patterns = [
+            "/" + _escape_gitignore((relative / directory / "skills" / name).as_posix())
+            for directory in (".agents", ".claude")
+            for name in sorted(names)
+        ]
+        lines[insertion:insertion] = [begin, *patterns, end]
+    if lines == original and path.exists():
+        return path.read_bytes()
+    return ("\n".join(lines) + ("\n" if lines else "")).encode()
 
 
 def _escape_gitignore(value: str) -> str:
@@ -480,13 +315,3 @@ def _escape_gitignore(value: str) -> str:
     return "".join(
         f"\\{character}" if character in special else character for character in value
     )
-
-
-def _duplicate_names(skills: Iterable[ResolvedSkill]) -> set[str]:
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    for skill in skills:
-        if skill.name in seen:
-            duplicates.add(skill.name)
-        seen.add(skill.name)
-    return duplicates

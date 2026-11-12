@@ -1,271 +1,300 @@
-"""Persistent source revisions, lock state, and profile views."""
+"""Project locks, reusable Git checkouts, and immutable profile link views."""
 
-import hashlib
-import json
 import os
 import shutil
-from collections.abc import Iterable
-from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
+from typing import Annotated, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from skill_manager.acquire import acquire_locked_source, acquire_source
 from skill_manager.catalog import (
+    Catalog,
     CatalogError,
+    ProfileDeclaration,
     ResolvedSkill,
     ResolvedSource,
     SourceDeclaration,
     discover_source,
+    load_catalog,
     resolve_profile,
 )
-from skill_manager.config import LoadedConfiguration
+from skill_manager.config import ProjectDeclaration, resolve_git_location, resolve_path
+from skill_manager.filesystem import digest, file_lock
+
+Revision = Annotated[str, Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
+LOCK_NAME = ".skill-manager.lock"
 
 
 class LockedSource(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    git: str | None
+    path: Path | None
     requested_ref: str | None
-    resolved_revision: str | None
+    resolved_revision: Revision | None
 
-    @field_validator("resolved_revision")
-    @classmethod
-    def validate_revision(cls, value: str | None) -> str | None:
-        if value is not None and (
-            len(value) not in {40, 64}
-            or any(character not in "0123456789abcdef" for character in value)
+    @model_validator(mode="after")
+    def validate_location(self) -> Self:
+        if self.git is not None:
+            if (
+                self.path is not None
+                or not self.requested_ref
+                or self.resolved_revision is None
+            ):
+                raise ValueError(
+                    "locked Git source requires a ref and revision, without a path"
+                )
+        elif (
+            self.path is None
+            or self.requested_ref is not None
+            or self.resolved_revision is not None
         ):
-            raise ValueError("resolved revision must be a hexadecimal Git object ID")
-        return value
+            raise ValueError("locked local source requires only a path")
+        return self
 
 
 class LockFile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: int = 1
+    version: Literal[1] = 1
+    declaration_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_revision: Revision | None
+    catalog: Catalog
     sources: dict[str, LockedSource]
 
-
-def sync(
-    configuration: LoadedConfiguration,
-    *,
-    update_lock: bool = False,
-) -> LockFile:
-    """Converge local source storage on the lock, optionally advancing it."""
-    if update_lock or not configuration.lock_path.is_file():
-        return _update_lock(configuration)
-
-    lock = load_lock(configuration)
-    source_store = configuration.state_dir / "sources"
-    source_store.mkdir(parents=True, exist_ok=True)
-    for name, declaration in configuration.catalog.sources.items():
-        if declaration.path is not None:
-            if not declaration.path.is_dir():
-                raise CatalogError(
-                    f"source '{name}' path does not exist: {declaration.path}"
+    @model_validator(mode="after")
+    def validate_sources(self) -> Self:
+        if self.sources.keys() != self.catalog.sources.keys():
+            raise ValueError("lock sources do not match the catalog snapshot")
+        for name, source in self.catalog.sources.items():
+            locked = self.sources[name]
+            if (locked.git, locked.path, locked.requested_ref) != (
+                source.git,
+                source.path,
+                source.ref,
+            ):
+                raise ValueError(
+                    f"locked source '{name}' identity differs from the catalog snapshot"
                 )
-            continue
+        return self
 
-        locked = lock.sources[name]
-        assert locked.resolved_revision is not None
-        destination = source_store / name / locked.resolved_revision
-        if destination.is_dir():
-            continue
-        with acquire_locked_source(
-            name,
-            declaration,
-            locked.resolved_revision,
-        ) as checkout:
-            _copy_source_atomically(checkout.root, destination)
-    return lock
+    def fingerprint(self) -> str:
+        return digest(self.model_dump())
 
 
-def _update_lock(configuration: LoadedConfiguration) -> LockFile:
-    """Resolve and persist every configured source, then atomically write the lock."""
-    locked: dict[str, LockedSource] = {}
-    source_store = configuration.state_dir / "sources"
-    source_store.mkdir(parents=True, exist_ok=True)
-
-    with ExitStack() as stack:
-        for name, declaration in configuration.catalog.sources.items():
-            if declaration.path is not None:
-                if not declaration.path.is_dir():
-                    raise CatalogError(
-                        f"source '{name}' path does not exist: {declaration.path}"
-                    )
-                locked[name] = LockedSource(
-                    requested_ref=None,
-                    resolved_revision=None,
-                )
-                continue
-
-            checkout = stack.enter_context(
-                acquire_source(name, declaration, configuration.config_path.parent)
-            )
-            assert checkout.resolved_revision is not None
-            destination = source_store / name / checkout.resolved_revision
-            if not destination.exists():
-                _copy_source_atomically(checkout.root, destination)
-            locked[name] = LockedSource(
-                requested_ref=declaration.ref,
-                resolved_revision=checkout.resolved_revision,
-            )
-
-    lock = LockFile(sources=locked)
-    _write_yaml_atomically(configuration.lock_path, lock.model_dump(mode="json"))
-    return lock
+@dataclass(frozen=True)
+class Resolution:
+    lock: LockFile
+    sources: tuple[ResolvedSource, ...]
+    selected: tuple[ResolvedSkill, ...]
 
 
-def load_lock(configuration: LoadedConfiguration) -> LockFile:
-    """Load lock state and ensure it still describes the configured sources."""
+def read_lock(root: Path, declaration: ProjectDeclaration) -> LockFile:
+    """Reject changed project intent instead of silently following a new source."""
+    path = root / LOCK_NAME
     try:
-        raw = yaml.safe_load(configuration.lock_path.read_text())
-    except OSError as error:
+        lock = LockFile.model_validate(yaml.safe_load(path.read_text()))
+    except (OSError, yaml.YAMLError) as error:
         raise CatalogError(
-            f"cannot read lock file {configuration.lock_path}; run sync first"
+            f"cannot read project lock {path}; run skm install: {error}"
         ) from error
-    except yaml.YAMLError as error:
+    if lock.declaration_digest != declaration.fingerprint():
+        raise CatalogError("project declaration changed; run skm update to accept it")
+    if (declaration.catalog.git is None) != (lock.catalog_revision is None):
         raise CatalogError(
-            f"invalid lock file {configuration.lock_path}: {error}"
-        ) from error
-    lock = LockFile.model_validate(raw)
-
-    declared_names = set(configuration.catalog.sources)
-    if set(lock.sources) != declared_names:
-        raise CatalogError(
-            "lock sources differ from configured sources; run sync --update-lock"
+            "catalog location does not match the project lock; run skm update"
         )
-    for name, declaration in configuration.catalog.sources.items():
-        locked = lock.sources[name]
-        if locked.requested_ref != declaration.ref:
-            raise CatalogError(f"source '{name}' ref changed; run sync --update-lock")
     return lock
 
 
-def resolve_locked_inventory(
-    configuration: LoadedConfiguration,
-    lock: LockFile,
-) -> tuple[ResolvedSource, ...]:
-    """Discover every skill available from locally synchronized sources."""
-    resolved_sources: list[ResolvedSource] = []
-    for name, declaration in configuration.catalog.sources.items():
-        locked = lock.sources[name]
-        root = _locked_source_root(configuration, name, declaration, locked)
-        resolved_sources.append(
-            discover_source(name, declaration, root, locked.resolved_revision)
+def resolve_installation(
+    root: Path,
+    declaration: ProjectDeclaration,
+    state_dir: Path,
+    *,
+    update: bool = False,
+    locked: bool = False,
+    network: bool = True,
+) -> Resolution:
+    """Prepare an installation, populating only shared caches before success.
+
+    Existing locks include a catalog snapshot, so install never follows moving
+    catalog or skill refs. Update refreshes both within the catalog's constraints.
+    Local skill sources are deliberately live, not immutable content snapshots.
+    """
+    if update and locked:
+        raise CatalogError("update and locked installation are mutually exclusive")
+    old_lock = None
+    if not update and (locked or (root / LOCK_NAME).exists() or not network):
+        old_lock = read_lock(root, declaration)
+    reference = declaration.catalog
+    catalog_revision = None
+    if reference.git is not None:
+        origin = resolve_git_location(reference.git, root)
+        assert reference.ref is not None
+        catalog_root, catalog_revision = cache_git(
+            state_dir,
+            origin,
+            reference.ref,
+            old_lock.catalog_revision if old_lock else None,
+            network=network,
         )
-
-    return tuple(resolved_sources)
-
-
-def resolve_locked_profile(
-    configuration: LoadedConfiguration,
-    lock: LockFile,
-) -> tuple[tuple[ResolvedSource, ...], tuple[ResolvedSkill, ...]]:
-    """Resolve the configured active profile against locked local inventory."""
-    sources = resolve_locked_inventory(configuration, lock)
-    profile_name = configuration.active_profile
-    if profile_name is None:
-        raise CatalogError("no active profile configured")
-    profile = configuration.catalog.profiles[profile_name]
-    selected = resolve_profile(profile_name, profile, sources)
-    duplicate_names = _duplicates(skill.name for skill in selected)
-    if duplicate_names:
+        catalog_path = catalog_root / reference.file
+        if not catalog_path.resolve().is_relative_to(catalog_root.resolve()):
+            raise CatalogError("catalog file escapes its repository")
+    else:
+        assert reference.path is not None
+        catalog_path = resolve_path(reference.path, root)
+    catalog = old_lock.catalog if old_lock else load_catalog(catalog_path)
+    catalog_base = catalog_path.parent
+    resolved: list[ResolvedSource] = []
+    locks: dict[str, LockedSource] = {}
+    for name, source in catalog.sources.items():
+        revision = None
+        if source.git is not None:
+            origin = resolve_git_location(source.git, catalog_base)
+            assert source.ref is not None
+            source_root, revision = cache_git(
+                state_dir,
+                origin,
+                source.ref,
+                old_lock.sources[name].resolved_revision if old_lock else None,
+                network=network,
+            )
+        else:
+            assert source.path is not None
+            source_root = resolve_path(source.path, catalog_base)
+            if not source_root.is_dir():
+                raise CatalogError(
+                    f"source '{name}' path does not exist: {source_root}"
+                )
+        locks[name] = LockedSource(
+            git=source.git,
+            path=source.path,
+            requested_ref=source.ref,
+            resolved_revision=revision,
+        )
+        resolved.append(discover_source(name, source, source_root, revision))
+    lock = old_lock or LockFile(
+        declaration_digest=declaration.fingerprint(),
+        catalog_revision=catalog_revision,
+        catalog=catalog,
+        sources=locks,
+    )
+    try:
+        profile = catalog.profiles[declaration.profile]
+    except KeyError as error:
         raise CatalogError(
-            "active profile contains duplicate skill names: "
-            + ", ".join(sorted(duplicate_names))
+            f"unknown catalog profile '{declaration.profile}'"
+        ) from error
+    combined = ProfileDeclaration(
+        include=[*profile.include, *declaration.include],
+        exclude=[*profile.exclude, *declaration.exclude],
+    )
+    selected = resolve_profile(declaration.profile, combined, resolved)
+    seen: set[str] = set()
+    for skill in selected:
+        if skill.name in seen:
+            raise CatalogError(
+                f"project selection contains duplicate skill name '{skill.name}'"
+            )
+        seen.add(skill.name)
+    return Resolution(lock, tuple(resolved), selected)
+
+
+def cache_git(
+    state_dir: Path,
+    origin: str,
+    ref: str,
+    revision: str | None = None,
+    *,
+    network: bool = True,
+) -> tuple[Path, str]:
+    """Cache by repository identity and exact revision, never by a source alias."""
+    identity = digest(origin)
+    parent = state_dir / "sources" / identity
+    if revision is not None:
+        destination = parent / revision
+        if destination.is_dir() and not destination.is_symlink():
+            return destination, revision
+    if not network:
+        raise CatalogError(f"locked checkout is missing for {origin}; run skm install")
+    declaration = SourceDeclaration(git=origin, ref=ref)
+    with file_lock(state_dir / "locks" / f"source-{identity}.lock"):
+        if revision is not None and (parent / revision).is_dir():
+            if (parent / revision).is_symlink():
+                raise CatalogError(f"source cache is a symlink: {parent / revision}")
+            return parent / revision, revision
+        acquisition = (
+            acquire_locked_source(identity, declaration, revision)
+            if revision
+            else acquire_source(identity, declaration, Path.cwd())
         )
-    return sources, selected
+        with acquisition as checkout:
+            assert checkout.resolved_revision is not None
+            revision = checkout.resolved_revision
+            destination = parent / revision
+            if os.path.lexists(destination):
+                if destination.is_symlink() or not destination.is_dir():
+                    raise CatalogError(f"invalid source cache entry: {destination}")
+                return destination, revision
+            parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(mkdtemp(prefix=".acquiring-", dir=parent))
+            try:
+                shutil.copytree(
+                    checkout.root, temporary, symlinks=True, dirs_exist_ok=True
+                )
+                os.replace(temporary, destination)
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+            return destination, revision
+
+
+def profile_view_path(
+    state_dir: Path, profile: str, selected: tuple[ResolvedSkill, ...]
+) -> Path:
+    identity = [
+        {"name": skill.name, "source": skill.source, "path": str(skill.path)}
+        for skill in selected
+    ]
+    return state_dir / "profiles" / profile / digest(identity)[:16]
 
 
 def build_profile_view(
-    configuration: LoadedConfiguration,
+    state_dir: Path,
+    profile: str,
     selected: tuple[ResolvedSkill, ...],
 ) -> Path:
-    """Build an immutable symlink view for the selected profile."""
-    identity = [
-        {
-            "name": skill.name,
-            "source": skill.source,
-            "path": str(skill.path),
-        }
-        for skill in selected
-    ]
-    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[
-        :16
-    ]
-    profile_name = configuration.active_profile
-    if profile_name is None:
-        raise CatalogError("no active profile configured")
-    parent = configuration.state_dir / "profiles" / profile_name
-    destination = parent / digest
-    if destination.is_dir():
+    """Publish one immutable view; concurrent callers reuse the winning view."""
+    destination = profile_view_path(state_dir, profile, selected)
+    with file_lock(state_dir / "locks" / f"view-{digest(str(destination))}.lock"):
+        if os.path.lexists(destination):
+            if destination.is_symlink() or not destination.is_dir():
+                raise CatalogError(f"invalid profile view: {destination}")
+            expected = {skill.name: str(skill.path) for skill in selected}
+            actual = {
+                entry.name: os.readlink(entry) if entry.is_symlink() else None
+                for entry in destination.iterdir()
+            }
+            if actual != expected:
+                raise CatalogError(
+                    f"profile view was modified externally: {destination}"
+                )
+            return destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(mkdtemp(prefix=".building-", dir=destination.parent))
+        try:
+            for skill in selected:
+                (temporary / skill.name).symlink_to(
+                    skill.path, target_is_directory=True
+                )
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
         return destination
-
-    parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(mkdtemp(prefix=".building-", dir=parent))
-    try:
-        for skill in selected:
-            (temporary / skill.name).symlink_to(skill.path, target_is_directory=True)
-        os.replace(temporary, destination)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    return destination
-
-
-def _locked_source_root(
-    configuration: LoadedConfiguration,
-    name: str,
-    declaration: SourceDeclaration,
-    locked: LockedSource,
-) -> Path:
-    if declaration.path is not None:
-        if not declaration.path.is_dir():
-            raise CatalogError(
-                f"source '{name}' path does not exist: {declaration.path}"
-            )
-        return declaration.path
-    if locked.resolved_revision is None:
-        raise CatalogError(f"Git source '{name}' has no locked revision")
-    root = configuration.state_dir / "sources" / name / locked.resolved_revision
-    if not root.is_dir():
-        raise CatalogError(f"locked source '{name}' is missing; run sync")
-    return root
-
-
-def _copy_source_atomically(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(mkdtemp(prefix=".acquiring-", dir=destination.parent))
-    shutil.rmtree(temporary)
-    try:
-        shutil.copytree(source, temporary, symlinks=True)
-        os.replace(temporary, destination)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-
-
-def _write_yaml_atomically(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("x") as handle:
-            yaml.safe_dump(value, handle, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _duplicates(names: Iterable[str]) -> set[str]:
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    for name in names:
-        if name in seen:
-            duplicates.add(name)
-        seen.add(name)
-    return duplicates

@@ -7,6 +7,8 @@ from typing import Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from skill_manager.filesystem import is_identifier
+
 
 class CatalogError(RuntimeError):
     """Raised when a valid catalog cannot be resolved against its sources."""
@@ -90,7 +92,7 @@ class Catalog(StrictModel):
     def validate_identifiers(self) -> Self:
         for kind, names in (("source", self.sources), ("profile", self.profiles)):
             for name in names:
-                if not _is_identifier(name):
+                if not is_identifier(name):
                     raise ValueError(f"invalid {kind} identifier: {name!r}")
         return self
 
@@ -139,7 +141,7 @@ def discover_source(
 
     for skill_file in skill_files:
         name = _read_skill_name(skill_file)
-        if not _is_identifier(name):
+        if not is_identifier(name):
             raise CatalogError(f"invalid skill name {name!r} in {skill_file}")
         if name in declaration.discover.exclude.skills:
             continue
@@ -229,15 +231,6 @@ def _matching_skill_files(
     if escaped:
         raise CatalogError(f"discovered skill escapes source root: {escaped[0]}")
     return sorted(matches)
-
-
-def _is_identifier(value: str) -> bool:
-    return (
-        bool(value)
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-    )
 
 
 def _read_skill_name(skill_file: Path) -> str:

@@ -1,69 +1,73 @@
 # Skill Manager
 
-The skill manager describes, acquires, classifies, and activates filesystem-based AI agent skills from shared sources.
+An explicit project installer for filesystem-based AI agent skills. A shared
+catalog is curated centrally; projects choose a profile and update independently.
 
-## Language
+**Catalog:** A YAML inventory of sources, classifications, and reusable profiles.
+Referenced explicitly by a project, from a Git repository/ref or local file.
+Catalog composition is one level deep; there are no conditional fragments.
 
-**Source**:
-A repository or local location containing one or more skills. A source is the unit of version selection, locking, and acquisition.
-_Avoid_: Repo, package
+**Source:** A Git repository or local directory containing skills. A source is
+the unit of acquisition and revision locking. Avoid: package.
 
-**Skill**:
-A discovered directory containing a `SKILL.md`. A skill inherits classification from its source unless it declares refinements.
-_Avoid_: Plugin, command
+**Skill:** A discovered directory containing `SKILL.md` and optional supporting
+resources. Its name comes from frontmatter, falling back to the directory name.
 
-**Requested ref**:
-The branch, tag, or commit named in a source declaration.
-_Avoid_: Version, pin
+**Requested ref:** The branch, tag, or commit approved in a catalog source or
+project catalog reference.
 
-**Resolved revision**:
-The exact immutable source revision selected for a requested ref.
-_Avoid_: Version, ref
+**Resolved revision:** The exact immutable Git object ID recorded in the lock.
+Independent local path sources have no Git revision and remain live.
 
-**Tag**:
-A label used to classify and select skills. A skill's effective tags combine inherited source tags with skill-specific refinements.
-_Avoid_: Category
+**Tag:** A classification label inherited from a source and refined per skill.
 
-**Profile**:
-A named set of selectors determining which skills are active.
-_Avoid_: Pack, skillset
+**Profile:** A named group of include/exclude selectors in the shared catalog.
 
-**Available skill**:
-A skill acquired into canonical storage but not necessarily exposed to a consumer.
-_Avoid_: Installed skill
+**Project declaration:** The committed `.skill-manager.yaml` naming the catalog,
+profile, and optional shared include/exclude refinements. It is authoritative;
+machine configuration and clone-local Git profile bindings are not consulted.
 
-**Active skill**:
-An available skill exposed to a consumer by the selected profile.
-_Avoid_: Loaded skill, installed skill
+**Project lock:** `.skill-manager.lock`, recording project intent, a catalog
+snapshot, its Git revision when applicable, and exact skill-source identities
+and revisions. Normally committed beside the declaration with matching visibility.
 
-**Consumer directory**:
-A filesystem directory scanned by an agent runtime for active skills.
-_Avoid_: Install directory, target
+**Available skill:** A skill discovered in the project's catalog inventory.
 
-**Reserved skill name**:
-A name within a shared consumer directory whose entry is owned by another manager. The skill manager never creates, changes, or removes that entry.
-_Avoid_: Ignored skill, excluded skill
+**Installed skill:** A selected available skill exposed through manager-owned
+project symlinks. Installation does not mean the agent has loaded the skill.
 
-**Activation scope**:
-The filesystem and process boundary within which a profile is exposed to agent harnesses. Project scope is the default; global scope requires explicit opt-in.
-_Avoid_: Install scope
+**Consumer directory:** A directory an agent scans for skills. The installer
+currently targets the fixed `.agents/skills` and `.claude/skills` pair.
 
-**Source store**:
-Persistent manager-owned storage for acquired revisions and generated profile views. Harnesses do not discover skills directly from this location.
-_Avoid_: Global skills directory
+**Source store:** Machine-local acquired checkouts, profile views, ownership
+manifests, installation receipts and writer locks. Shared by projects. Git source
+identity includes the repository location, not just a human-readable alias.
 
-**Project binding**:
-A machine-local association between a project and an activation profile, normally stored in the clone's local Git configuration. A committed project declaration is an explicit sharing mechanism rather than the default.
-_Avoid_: Project config file
+**Profile view:** An immutable directory of symlinks for one resolved selection,
+under `profiles/<profile>/<digest>` in the source store. Project links target it.
 
-**Project refinement**:
-A clone-local skill or tag inclusion or exclusion layered over a project's base profile. Explicit skill refinements take precedence over tag refinements, and exclusions take precedence over inclusions at the same specificity.
-_Avoid_: Project dependency, profile mutation
+**Ownership manifest:** A record of the exact link targets the manager owns in
+one consumer. An unrelated same-name entry is never adopted automatically.
 
-**Isolated session**:
-An agent launch where the manager applies locked project state and suppresses ordinary home-directory skills so the project's profile and unmanaged project-local skills are the only ones exposed.
-_Avoid_: Managed run, sandbox
+**Installation receipt:** The project root and fingerprint of the installed lock.
+It detects cases where a project lock changed without installation.
 
-**Harness pass-through**:
-An agent CLI launch handed to the real executable with unchanged arguments and no project state change, used for harness management subcommands and metadata flags that a harness recognizes only in the first argument.
-_Avoid_: Bypass, skipped launch
+**Drift:** A mismatch among project intent, lock, receipt, expected links, and Git
+exclude bookkeeping. Local `status` does not detect new upstream releases or
+content edits inside live local skills.
+
+**Install:** Reproduce a compatible existing lock, or resolve and create the
+first lock. Missing Git content may be hydrated without moving locked revisions.
+
+**Update:** Deliberately adopt the catalog's current choices within its approved
+refs, update the project lock, and install the resulting selection.
+
+**Uninstall:** Remove verified owned project links and their install bookkeeping.
+Retain the declaration, project lock, unmanaged skills and shared source storage.
+
+**Retention:** State that outlives an installation or declaration. Source
+revisions and generated views currently have no garbage collection.
+
+The former concepts of activation scope, isolated session, harness pass-through,
+and implicit clone-local profile binding are retired. Skill Manager neither
+intercepts agent launches nor suppresses home-directory skills.

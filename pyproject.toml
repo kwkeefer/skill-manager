@@ -1,7 +1,7 @@
 [project]
 name = "skill-manager"
-version = "0.1.0"
-description = "Declarative source, profile, and provisioning manager for AI agent skills"
+version = "0.2.0"
+description = "Explicit project skill installer with centrally curated catalogs"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

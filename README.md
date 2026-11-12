@@ -1,224 +1,212 @@
 # Skill Manager
 
-A prototype for declaring, classifying, versioning, and provisioning
-filesystem-based AI agent skills.
+Curate a catalog once. Install selected skills into each project explicitly.
 
-Sources are versioned as a unit, skills inherit and refine source tags, and
-profiles select discovered skills using source, tag, and name constraints.
-Project-scoped activation is the default; persistent storage is never directly
-scanned by harnesses.
+Skill Manager keeps a shared store of acquired skills, while each project names
+the catalog and profile it uses. A project lock records the exact catalog and
+skill revisions. Projects can share cached content and still update independently.
 
-## Why this exists
-
-I kept running into the same problem across different projects: they needed many
-of the same skills, but not quite the same set. Copying skill files into every
-repository made updates tedious and let the copies drift apart. Installing all
-of them globally avoided duplication, but created a different problem: every
-agent saw an ever-growing collection of skills, including many that had nothing
-to do with the project in front of it.
-
-That kind of skill sprawl is more than untidy. A large global catalog gives the
-agent more descriptions to consider, makes accidental or ambiguous skill
-activation more likely, and spends context on capabilities that are irrelevant
-to the current task. The useful set of skills for a Rust service is not
-necessarily the useful set for a Python library or a writing project.
-
-Skill Manager exists to separate **where skills come from** from **where they
-are enabled**. Multiple projects can reuse skills from the same maintained,
-versioned sources, while custom profiles select only the skills appropriate for
-a particular project. This keeps shared skills consistent without forcing every
-skill into every agent session.
+Starting an agent does not run Skill Manager or change project state. There are
+no PATH shims, launch interception, machine-selected profiles, or global installs.
 
 ## Installation
 
-Skill Manager currently supports macOS and Linux with Python 3.14 or newer, Git,
-a POSIX shell, and filesystem symlinks. Install [`uv`](https://docs.astral.sh/uv/),
-then install `skm` from a repository checkout:
+Requires macOS or Linux, Python 3.14+, Git, and filesystem symlinks. From a checkout:
 
-```bash
+```sh
 uv tool install .
 skm --help
 ```
 
-For development, use `uv run skm` from the checkout instead.
+For development, use `uv run skm`. Version 0.2 replaces the previous shim-based
+CLI; existing users should follow [the migration guide](docs/migration.md).
 
-## Preferred workflow
+## Curate the shared catalog
 
-Keep one machine configuration at `~/.config/skill-manager/config.yaml`. Override
-that path with `SKILL_MANAGER_CONFIG` when needed.
-
-```bash
-# One-time machine setup
-skm setup
-# Edit the generated catalog, then acquire its locked sources
-skm sync
-```
-
-When no machine configuration exists, `setup` creates a starter configuration,
-catalog, and local skills directory under `~/.config/skill-manager/`. Existing
-configuration is left untouched. By default it detects installed harnesses,
-creates shims only for those found, and prints a `PATH` export for shell startup.
-Use `skm setup --no-shims` to initialize configuration without intercepting any
-harness commands. Installed shims resolve a profile whenever a harness starts.
-
-Bind a Git clone to a profile once:
-
-```bash
-cd ~/code/some-project
-skm project use rust-development
-```
-
-The binding is written by `git config --local` to `.git/config`. It does not
-modify the working tree and cannot be committed or pushed. Normal use is then:
-
-```bash
-pi
-claude
-codex
-```
-
-Each shim reapplies locked state without networking, suppresses ordinary
-home-directory skills where supported, and launches with the project's profile
-plus unmanaged project-local skills.
-
-### Shims and harness management
-
-Shims isolate agent sessions only. A harness recognizes its own management
-subcommands in the first argument, before it reads any agent options, so
-`pi update`, `pi install <source>`, `pi list`, `pi config`, `pi auth`,
-`claude doctor`, `claude mcp`, `codex exec`, `codex login`, and `--help` or
-`--version` are handed to the real executable with their arguments unchanged and
-without applying project state. Injecting isolation flags ahead of those words
-would make the harness read the subcommand as a prompt, which is why
-`pi update` once started a session prompted with the word `update`.
-
-Arguments after the harness name reach the harness exactly as typed, including
-option-looking values and `--`. Two overrides cover policy drift:
-
-```bash
-# Isolate a launch the shim classified as management, such as a prompt that
-# begins with a subcommand word:
-SKM_LAUNCH_MODE=isolate pi update the flaky tests
-
-# Never intercept a launch, without editing shell startup:
-SKM_LAUNCH_MODE=passthrough pi
-```
-
-Machine configuration can add subcommands a harness introduced after this
-release, so the built-in allowlist never becomes a blocker:
+Keep `catalog.yaml` in a repository you maintain:
 
 ```yaml
-harness_passthrough:
-  pi:
-    - sessions
+sources:
+  engineering:
+    git: git@github.com:your-team/agent-skills.git
+    ref: v1.2.0
+    tags: [coding]
+    skills:
+      python-testing:
+        tags:
+          add: [python]
+
+profiles:
+  python-development:
+    include:
+      - source: engineering
+        tags: [python]
 ```
 
-Inspect the current inventory and classifications:
+A source is a repository or local directory containing `SKILL.md` files. Skills
+inherit source tags; per-skill declarations can add/remove tags or disable
+inheritance. Selectors constrain source, tags, and/or skill names. All constraints
+within a selector must match; include selectors are combined, then exclusions win.
 
-```bash
-skm inspect                    # skills in the default profile
-skm inspect --tags             # tag counts and source coverage
-skm inspect --profile rust     # one profile's selected skills
-skm inspect --profile rust --tags
-skm inspect --profiles         # compare all configured profiles
-```
+Use a tag or commit for a deliberately approved skill version. A branch such as
+`main` explicitly allows `update` to resolve that branch's current revision.
+Skill Manager never chooses a version beyond the ref declared by the catalog.
 
-Refine the current project's base profile without creating a project file:
+## Select skills for a project
 
-```bash
-skm add tdd
-skm add --tag rust
-skm remove rust-perf
-skm remove --tag productivity
-```
-
-Use `--project /path/to/project` when operating outside the target directory.
-Refinements are stored in clone-local Git configuration and applied immediately.
-Explicit skill choices override tag choices; exclusions override inclusions at
-the same specificity.
-
-## Optional committed declaration
-
-A team may deliberately share a profile by committing `.skill-manager.yaml`:
+Commit `.skill-manager.yaml` in the project:
 
 ```yaml
-profile: rust-development
-global_skills: disabled
+catalog:
+  git: git@github.com:your-team/skill-catalog.git
+  ref: main
+  # file: catalogs/engineering.yaml  # defaults to catalog.yaml
+profile: python-development
 ```
 
-This takes precedence over local Git configuration, but it is not required for
-the normal workflow. Machine configuration may also define
-`default_project_profile` as a fallback.
+Or reference a local catalog file:
 
-## Prototype example
-
-The example keeps all generated state beneath `examples/`:
-
-```bash
-uv run skm sync examples/config.yaml
-uv run skm project apply examples/config.yaml examples/project
-
-eval "$(uv run skm project env examples/config.yaml examples/project)"
-pi
+```yaml
+catalog:
+  path: ../skill-catalog/catalog.yaml
+profile: python-development
 ```
 
-## Safety and trust model
+Local catalog paths are relative to the project declaration. Local source paths
+and filesystem Git remotes are relative to the catalog file. A Git catalog may
+bundle skills using `path: skills`; those skills come from the locked catalog
+checkout. Independent local source directories remain live and unversioned.
 
-Skill Manager is an alpha workstation tool, not a sandbox. It assumes that your
-machine configuration, catalogs, declared Git repositories, local source trees,
-and project declarations are trusted. Acquired skills can contain executable
-scripts and instructions that agent harnesses may use. Do not add an untrusted
-source or launch a managed harness in an untrusted project without reviewing it.
-Manager state is protected against accidental collisions, not malicious changes
-by another process running as the same user.
+Project-specific refinements are optional, shared, and explicit:
 
-Existing project-local skills are preserved. The manager records only links it
-created and refuses to overwrite a same-named unmanaged skill. Generated links
-are hidden from `git status` through a marked block in `.git/info/exclude`; the
-tracked `.gitignore` is not changed. Harness launch never accesses the network.
-Run `skm sync` to hydrate locked revisions on a workstation, or
-`skm sync --update-lock` when you deliberately want to resolve newer
-source revisions.
-
-Global activation remains available only when machine configuration explicitly
-defines both `active_profile` and `consumers`.
-
-## Disabling or uninstalling
-
-For a single launch, or a temporary pause without editing shell startup, set
-`SKM_LAUNCH_MODE=passthrough`. To stop intercepting harness commands permanently,
-remove the `PATH` export printed by `skm setup` from your shell startup file and
-remove the generated shims:
-
-```bash
-rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/skill-manager/shims"
+```yaml
+catalog:
+  path: ../skill-catalog/catalog.yaml
+profile: python-development
+include:
+  - skills: [review-checklist]
+exclude:
+  - tags: [experimental]
 ```
 
-If installed with uv, uninstall the CLI with:
+Project includes add to the profile's includes. Profile and project exclusions
+both apply to the final selection. Duplicate final skill names are an error.
+Refinements are no longer read from clone-local Git configuration.
 
-```bash
-uv tool uninstall skill-manager
+## Install and update
+
+```sh
+skm install             # first run resolves the catalog and creates the lock
+skm install --locked    # reproduce an existing compatible project lock
+skm status              # report local drift, without networking or repairs
+skm status --check      # exit 1 on drift; 0 when clean
+skm update              # adopt current catalog choices and update this project
+skm list                # available skills, marking the selected ones
+skm list --profiles     # catalog profiles and their selection counts
+skm uninstall           # remove verified manager-owned links and install records
 ```
 
-Configuration and acquired state are retained intentionally. Delete
-`~/.config/skill-manager` and `${XDG_DATA_HOME:-$HOME/.local/share}/skill-manager`
-only when you no longer need them. Previously generated project skill symlinks
-are not removed automatically; remove only symlinks owned by Skill Manager and
-preserve unmanaged project skills.
+Every command accepts `--project /path/to/project`. Running inside a subdirectory
+finds the nearest `.skill-manager.yaml`, stopping at the Git repository root.
+No declaration means no implicit machine profile or installation.
 
-See [`examples/catalog.yaml`](examples/catalog.yaml) and
-[`examples/config.yaml`](examples/config.yaml) for complete configuration examples.
+`install` uses `.skill-manager.lock` when it exists and hydrates missing cached
+content at the locked revisions. It does not advance catalog or source refs or
+rewrite an existing compatible lock. `--locked` additionally requires a lock.
+Cached installs work offline; fetching missing Git checkouts requires access to
+their repositories and exact revisions.
 
-## Prototype limitations
+`update` rereads the local catalog or fetches its requested Git ref, resolves the
+skill refs it approves, then installs and writes the new lock. Editing the project
+declaration requires an explicit `update` if a lock already exists. Other projects
+keep their own locks and installed selections.
 
-- The management subcommand allowlist is version-pinned; harnesses that add new
-  subcommands need a `harness_passthrough` entry until this tool is revalidated.
-- Non-Git project bindings do not yet have a central path registry.
-- Claude Code setting-source isolation needs integration testing against the installed release.
-- Codex isolation enumerates home skills at process launch and disables them by exact path.
-- Built-in and administrator-managed harness skills are not uniformly suppressible.
-- No migration/adoption command exists for links created by the current chezmoi scripts.
-- Old source revisions and profile generations are not garbage-collected.
+Commit the declaration and lock together. The lock contains a validated catalog
+snapshot, catalog revision, source locations, requested refs, and resolved
+revisions. Give it the same visibility as the catalog: private URLs, source names,
+or local paths must not be published in a public project. Git refs alone do not
+replace a lock; branch and tag names can move.
+
+`status` checks the declaration against the lock, the installation receipt, each
+owned link/target, and the Git exclude block. It does not check whether an upstream
+branch has advanced. Independent local skill content is live through symlinks;
+status does not hash that content or claim it is immutable. `list` uses the locked
+catalog when present; without a lock it may fetch content into the shared store
+but does not create project links or a lock. Discovery currently acquires the
+catalog's entire source inventory, not just selected skills.
+
+For CI, install first, then check:
+
+```sh
+skm install --locked
+skm status --check
+```
+
+Drift exits 1 with `status --check`; invalid usage/configuration and command errors
+exit 2. A fresh clone has no installation receipt, so checking before installation
+reports drift. Private catalogs need the usual Git credentials available in CI.
+
+## Storage and ownership
+
+Skills are symlinked into both `.agents/skills` and `.claude/skills`. The target is
+a generated profile view in the shared store; supporting scripts and resources
+remain beside each `SKILL.md`. Skill content is never copied into the project.
+
+The default store is `${XDG_DATA_HOME:-$HOME/.local/share}/skill-manager`.
+Override it with `SKILL_MANAGER_STATE_DIR` or `--state-dir`. Use the same store
+for install, status, and uninstall: it contains ownership manifests as well as
+cached sources. Source checkouts are keyed by repository identity and revision.
+
+Unmanaged project-local skills are preserved. Same-name collisions, externally
+changed owned entries, Git-tracked managed entries, and symlinked consumer
+directories are refused. All consumers are preflighted before mutation. Ordinary
+failures roll back links, manifests, the project lock, receipt, and Git excludes.
+Cooperating commands sharing a store serialize project changes and view creation.
+Rollback is not a durable crash-recovery journal; sudden process termination or
+disk failure may require inspection with `status`.
+
+Generated links are hidden with a project-specific block in `.git/info/exclude`.
+Other rules and other projects' blocks are preserved. Non-Git projects have no
+Git ignore bookkeeping. Ignore rules are convenience, not a confidentiality
+boundary: Git can record a symlink's name and target, and forced adds remain possible.
+
+`uninstall` uses ownership manifests and works without the catalog, project
+declaration, or source checkouts. It retains the project lock/declaration,
+unmanaged entries, and shared source/profile storage. It refuses to delete owned
+entries that have changed externally. Old source revisions are not garbage-collected.
+When a declaration is missing, retained project locks and installation records
+keep uninstall scoped to the nearest known project, including nested projects.
+
+## Agent behavior and trust
+
+Installation adds project skills. Skill Manager does not suppress skills loaded
+from home directories, ancestor directories, plugins, or agent built-ins. Keeping
+user-managed home skills empty is an operational policy, not an enforced sandbox.
+Each agent retains its own skill-discovery behavior.
+
+Catalogs, project declarations, source trees, and manager state are trusted
+workstation inputs. Skills may include executable scripts and instructions.
+Review a catalog before installing it. Separate private catalogs explicitly and
+keep private source/state locations outside personal dotfile publishing paths.
+
+## Example and development
+
+The checked-in example fetches its declared Git source:
+
+```sh
+uv run skm install --project examples/project --state-dir examples/.prototype-state
+uv run skm status --check --project examples/project --state-dir examples/.prototype-state
+uv run skm uninstall --project examples/project --state-dir examples/.prototype-state
+```
+
+```sh
+uv run pytest
+ruff check src tests
+ruff format --check src tests
+```
+
+See [ADR 0001](docs/adr/0001-explicit-project-installer.md) for the architectural
+decision and [CONTEXT.md](CONTEXT.md) for the glossary.
 
 ## License
 

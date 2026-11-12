@@ -9,3 +9,5 @@ examples/.prototype-consumer/
 examples/config.lock.yaml
 examples/project/.agents/
 examples/project/.claude/
+# Example runs create a disposable project lock; real projects commit their locks.
+examples/project/.skill-manager.lock
