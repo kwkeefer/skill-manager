@@ -189,6 +189,45 @@ workstation inputs. Skills may include executable scripts and instructions.
 Review a catalog before installing it. Separate private catalogs explicitly and
 keep private source/state locations outside personal dotfile publishing paths.
 
+## Optional agent skill
+
+This repository includes [a `skill-manager` skill](skills/skill-manager/SKILL.md)
+that teaches agents to select, install, update, and troubleshoot project skills.
+It is opt-in through the existing catalog and profile/project selectors. Installing
+the Python CLI alone does not install this skill into any agent directory.
+
+Add this source to your shared catalog, choosing a tag or commit that contains
+the skill and matches the explicit installer CLI (0.2 or later):
+
+```yaml
+sources:
+  skill-manager:
+    git: https://github.com/kwkeefer/skill-manager.git
+    ref: <approved-tag-or-commit>
+    discover:
+      include: [skills/skill-manager/SKILL.md]
+```
+
+Then add this selector to a catalog profile or to your project's declaration:
+
+```yaml
+include:
+  - source: skill-manager
+    skills: [skill-manager]
+```
+
+Merge these entries with your existing configuration. Project selectors can only
+select sources already declared by the catalog; profile and project exclusions
+still apply. Run `skm install` for a first installation, or `skm update` to adopt
+the change in an already locked project, then `skm status --check`. An update
+also refreshes other catalog sources within their approved refs. To opt out,
+remove the selector (or exclude this skill if a shared profile includes it) and
+run `skm update` again.
+
+The skill uses normal revision locking, ownership, and uninstall behavior. Its
+explicit discovery path keeps development skills elsewhere in this repository
+out of the source inventory.
+
 ## Example and development
 
 The checked-in example fetches its declared Git source:
