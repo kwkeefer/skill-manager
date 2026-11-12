@@ -192,7 +192,9 @@ keep private source/state locations outside personal dotfile publishing paths.
 ## Optional agent skill
 
 This repository includes [a `skill-manager` skill](skills/skill-manager/SKILL.md)
-that teaches agents to select, install, update, and troubleshoot project skills.
+that teaches agents to select, install, update, and troubleshoot project skills,
+and to maintain shared catalogs and profiles. Its short entry point links to
+separate project and catalog workflows that agents can read as needed.
 It is opt-in through the existing catalog and profile/project selectors. Installing
 the Python CLI alone does not install this skill into any agent directory.
 

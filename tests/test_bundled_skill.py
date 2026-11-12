@@ -1,6 +1,7 @@
 """Exercise the shipped usage skill through ordinary catalog selection."""
 
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -15,6 +16,8 @@ def test_shipped_skill_is_discovered_and_installed_only_when_selected(
 ) -> None:
     repository = Path(__file__).resolve().parents[1]
     shipped = repository / "skills/skill-manager/SKILL.md"
+    references = re.findall(r"\]\((references/[^)]+)\)", shipped.read_text())
+    assert references, "The skill should link its on-demand workflows"
     catalog = yaml.safe_load(workspace.catalog.read_text())
     catalog["sources"]["skill-manager"] = {
         "path": str(repository),
@@ -39,6 +42,10 @@ def test_shipped_skill_is_discovered_and_installed_only_when_selected(
         installed = workspace.root / directory / "skills/skill-manager"
         assert installed.is_symlink()
         assert (installed / "SKILL.md").read_bytes() == shipped.read_bytes()
+        for reference in references:
+            assert (installed / reference).read_bytes() == (
+                shipped.parent / reference
+            ).read_bytes()
     assert not project_status(workspace.root, workspace.state).issues
 
     lock = (workspace.root / LOCK_NAME).read_bytes()
